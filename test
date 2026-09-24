@@ -1,0 +1,599 @@
+import os
+import sys
+import time
+import random
+import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+
+# Đảm bảo mã hóa UTF-8 cho stdout/stderr trên Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from groq import Groq, RateLimitError, APIError
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+# Tên biến môi trường API Key của Groq
+ENV_API_KEY = "GROQ_API_KEY"
+
+DEFAULT_INPUT_CSV = "sampled_1000_seeker_posts.csv"
+DEFAULT_OUTPUT_CSV = "sampled_1000_with_responses.csv"
+DEFAULT_MODEL = "qwen/qwen3.8-27b"
+
+RESPONSE_COL = "llm_response"
+# Cột "giải thích suy đoán": gọi LLM lần 2, SAU khi đã có llm_response, để nó tự
+# đoán vì sao reply lại viết như vậy. Đây KHÔNG phải reasoning thật của model —
+# chỉ là 1 lời suy luận hậu kiểm (post-hoc). Đặt tên khác cột "rationales" có sẵn
+# trong dataset gốc (cột đó là rationale cho "level", không liên quan llm_response).
+RATIONALE_COL = "llm_response_rationale"
+# Cột MỚI: vệt suy nghĩ (reasoning/thinking) THẬT của model, sinh ra CÙNG lúc với
+# llm_response trong CÙNG 1 lệnh gọi (không phải suy đoán sau). Chỉ có giá trị khi
+# --reasoning-effort khác "none".
+REASONING_COL = "llm_reasoning"
+
+SYSTEM_PROMPT = """You are a helpful assistant responding to someone in a casual chat context.
+
+Read the user's message, then respond the way a thoughtful person would reply in a real conversation — not an academic essay or clinical analysis.
+
+Guidelines:
+- Match the length of your reply to the input. A short, casual message deserves a short, natural reply — often just a few sentences. Only write longer when the situation clearly calls for more detail, and even then avoid padding or filler.
+- Do not open with a general evaluative statement about what the user said (e.g. "Your statement is a powerful testament to..."). Respond to them directly, the way a person would in a real reply.
+- Avoid academic or analytical phrasing — no formal transitions ("Furthermore," "This phenomenon often stems from..."), no textbook-style explanations, no listing multiple restatements of the same point.
+- Write in plain, conversational language, as if messaging someone you know, not writing a report.
+*-
+CRITICAL: Your final output must ONLY contain your reply to the user. Do not repeat the user's input, use quotation marks, include step numbers, or add any prefixes/meta-commentary. Just output the pure response."""
+
+# Prompt riêng cho bước "giải thích" (--mode explain). Chạy SAU khi đã có
+# llm_response, KHÔNG đụng tới nội dung llm_response đã sinh ra trước đó.
+EXPLAIN_SYSTEM_PROMPT = """You are analyzing a reply that was already written in a casual chat conversation.
+
+You will be given the original message and the reply that was sent back. In 1-2 plain sentences, explain
+what approach the reply took and why it likely reads that way — for example: did it validate the feeling,
+jump straight to advice/solutions, stay light or humorous, ask a question, minimize the problem, etc. Base
+this only on what is visible in the reply text itself. Do not judge whether the reply was good or bad, just
+describe its approach neutrally.
+
+CRITICAL: Output ONLY the explanation as plain text. No labels, no quotes, no prefixes, no meta-commentary."""
+
+
+def check_api_key():
+    api_key = os.environ.get(ENV_API_KEY)
+    if not api_key:
+        print("=" * 60)
+        print(f"[LOI] Chua tim thay bien moi truong: {ENV_API_KEY}")
+        print("Vui long thiet lap bien moi truong truoc khi chay:")
+        print("  - Tren PowerShell:  $env:GROQ_API_KEY=\"gsk_xxxxxxxxxxxx\"")
+        print("  - Tren CMD:         set GROQ_API_KEY=gsk_xxxxxxxxxxxx")
+        print("=" * 60)
+        sys.exit(1)
+    return api_key
+
+
+def generate_response_for_post(
+    client,
+    model: str,
+    seeker_post: str,
+    stream_to_console: bool = False,
+    max_retries: int = 5,
+    reasoning_effort: str = "none",
+    reasoning_format: str = "parsed",
+):
+    """
+    Gửi prompt đến mô hình LLM trên Groq.
+    - Sử dụng role 'system' cho chỉ dẫn và role 'user' cho nội dung seeker_post.
+    - Nếu stream_to_console=True: in trực tiếp từng chunk ra terminal (dùng khi chạy tuần tự).
+    - Nếu stream_to_console=False: thu thập phản hồi và trả về (dùng khi chạy song song).
+    - Tự động retry với backoff + jitter khi gặp Rate Limit.
+
+    reasoning_effort: "none" (mặc định, giữ nguyên hành vi cũ — model KHÔNG suy nghĩ,
+      không có vệt reasoning). Đặt "low"/"medium"/"high" để BẬT reasoning — model sẽ
+      thật sự "suy nghĩ" trước khi trả lời, và ta lấy được vệt suy nghĩ đó.
+    reasoning_format: chỉ có ý nghĩa khi reasoning_effort != "none".
+      - "parsed": vệt suy nghĩ được Groq tách riêng vào field `reasoning`, không lẫn
+        vào nội dung trả lời (khuyến dùng, dễ lưu vào 1 cột CSV).
+      - "raw": vệt suy nghĩ nằm ngay trong content, bọc trong tag <think>...</think>.
+      - "hidden": model vẫn suy nghĩ nhưng KHÔNG trả về vệt suy nghĩ.
+
+    Trả về tuple (response_text, reasoning_text). reasoning_text luôn là ""
+    khi reasoning_effort="none".
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": seeker_post}
+    ]
+
+    create_kwargs = dict(
+        model=model,
+        messages=messages,
+        reasoning_effort=reasoning_effort,
+        stream=True,  # Vẫn giữ streaming thời gian thực
+    )
+    # reasoning_format chỉ được Groq chấp nhận khi reasoning thực sự bật
+    if reasoning_effort != "none":
+        create_kwargs["reasoning_format"] = reasoning_format
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = client.chat.completions.create(**create_kwargs)
+
+            response_chunks = []
+            reasoning_chunks = []
+            for chunk in completion:
+                delta = chunk.choices[0].delta
+                content_piece = getattr(delta, "content", None) or ""
+                # getattr an toàn: field "reasoning" có thể không tồn tại tùy phiên
+                # bản SDK/model — không để việc này làm crash luồng chạy.
+                reasoning_piece = getattr(delta, "reasoning", None) or ""
+
+                if stream_to_console:
+                    if reasoning_piece:
+                        print(reasoning_piece, end="", flush=True)
+                    if content_piece:
+                        print(content_piece, end="", flush=True)
+
+                if content_piece:
+                    response_chunks.append(content_piece)
+                if reasoning_piece:
+                    reasoning_chunks.append(reasoning_piece)
+
+            if stream_to_console:
+                print("\n")
+
+            return "".join(response_chunks).strip(), "".join(reasoning_chunks).strip()
+
+        except RateLimitError as e:
+            # Thêm random jitter để tránh các luồng song song cùng gửi lại một thời điểm
+            jitter = random.uniform(1.0, 3.0)
+            wait_time = (10 * attempt) + jitter
+            if stream_to_console:
+                print(f"\n[RateLimit] Dat gioi han request. Cho {wait_time:.1f}s (Lan thu {attempt}/{max_retries})...")
+            time.sleep(wait_time)
+        except APIError as e:
+            time.sleep(5)
+        except Exception as e:
+            if attempt == max_retries:
+                return f"[ERROR: {str(e)}]", ""
+            time.sleep(3)
+
+    return "", ""
+
+
+def generate_explanation_for_response(
+    client,
+    model: str,
+    seeker_post: str,
+    llm_response: str,
+    max_retries: int = 5,
+):
+    """
+    Gọi LLM lần 2 (không streaming) để giải thích ngắn gọn vì sao llm_response
+    lại được viết như vậy. Đây là một lệnh gọi HOÀN TOÀN TÁCH BIỆT với
+    generate_response_for_post — không đọc lại, không ghi đè cột llm_response.
+    """
+    if not llm_response or not str(llm_response).strip():
+        return ""
+
+    prompt = f"Original message:\n{seeker_post}\n\nReply given:\n{llm_response}"
+    messages = [
+        {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                reasoning_effort="none",
+                stream=False,
+            )
+            return (completion.choices[0].message.content or "").strip()
+        except RateLimitError:
+            jitter = random.uniform(1.0, 3.0)
+            wait_time = (10 * attempt) + jitter
+            time.sleep(wait_time)
+        except APIError:
+            time.sleep(5)
+        except Exception as e:
+            if attempt == max_retries:
+                return f"[ERROR: {str(e)}]"
+            time.sleep(3)
+
+    return ""
+
+
+def process_sequential(
+    client,
+    model,
+    out_df,
+    target_indices,
+    output_csv,
+    delay=1.0,
+    reasoning_effort="none",
+    reasoning_format="parsed",
+):
+    """Chạy tuần tự từng câu và stream trực tiếp ra terminal."""
+    total = len(target_indices)
+    for i, idx in enumerate(target_indices, start=1):
+        seeker_post = str(out_df.at[idx, "seeker_post"])
+        sp_id = out_df.at[idx, "sp_id"] if "sp_id" in out_df.columns else idx
+
+        print(f"\n--- [{i}/{total}] Seeker Post (ID: {sp_id}) ---")
+        print(f"Input: {seeker_post}")
+        print("Response (Streaming):")
+
+        response, reasoning = generate_response_for_post(
+            client=client,
+            model=model,
+            seeker_post=seeker_post,
+            stream_to_console=True,
+            reasoning_effort=reasoning_effort,
+            reasoning_format=reasoning_format,
+        )
+        out_df.at[idx, "llm_response"] = response
+        if reasoning_effort != "none":
+            out_df.at[idx, REASONING_COL] = reasoning
+
+        # Lưu checkpoint ngay lập tức
+        out_df.to_csv(output_csv, index=False, encoding="utf-8")
+
+        if delay > 0:
+            time.sleep(delay)
+
+
+def process_parallel(
+    client,
+    model,
+    out_df,
+    target_indices,
+    output_csv,
+    concurrency=5,
+    verbose=False,
+    reasoning_effort="none",
+    reasoning_format="parsed",
+):
+    """Chạy song song nhiều request đến Groq bằng ThreadPoolExecutor với thanh tiến trình."""
+    total = len(target_indices)
+    save_lock = threading.Lock()
+
+    print(f"Khoi dong {concurrency} luong song song de xu ly {total} cau...")
+
+    if HAS_TQDM:
+        pbar = tqdm(total=total, desc="Tien do xu ly", unit="cau")
+    else:
+        pbar = None
+
+    def worker_task(idx):
+        seeker_post = str(out_df.at[idx, "seeker_post"])
+        sp_id = out_df.at[idx, "sp_id"] if "sp_id" in out_df.columns else idx
+
+        response, reasoning = generate_response_for_post(
+            client=client,
+            model=model,
+            seeker_post=seeker_post,
+            stream_to_console=False,
+            reasoning_effort=reasoning_effort,
+            reasoning_format=reasoning_format,
+        )
+
+        # Lưu an toan giua cac luong
+        with save_lock:
+            out_df.at[idx, "llm_response"] = response
+            if reasoning_effort != "none":
+                out_df.at[idx, REASONING_COL] = reasoning
+            out_df.to_csv(output_csv, index=False, encoding="utf-8")
+
+        if pbar is not None:
+            pbar.update(1)
+            if verbose:
+                preview = response[:60].replace("\n", " ")
+                tqdm.write(f"-> [ID: {sp_id}] Hoan tat: \"{preview}...\"")
+        else:
+            print(f"[Done] ID: {sp_id} hoan tat")
+
+        return idx
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(worker_task, idx) for idx in target_indices]
+        for _ in as_completed(futures):
+            pass
+
+    if pbar is not None:
+        pbar.close()
+
+
+def process_explain_parallel(
+    client,
+    model,
+    out_df,
+    target_indices,
+    output_csv,
+    concurrency=5,
+):
+    """
+    Chạy song song bước 'giải thích': chỉ điền cột RATIONALE_COL cho các dòng
+    đã có sẵn llm_response nhưng chưa có rationale. Không đụng tới llm_response.
+    """
+    total = len(target_indices)
+    save_lock = threading.Lock()
+
+    print(f"Khoi dong {concurrency} luong song song de giai thich {total} phan hoi...")
+
+    pbar = tqdm(total=total, desc="Giai thich", unit="cau") if HAS_TQDM else None
+
+    def worker_task(idx):
+        seeker_post = str(out_df.at[idx, "seeker_post"])
+        llm_response = str(out_df.at[idx, RESPONSE_COL])
+        sp_id = out_df.at[idx, "sp_id"] if "sp_id" in out_df.columns else idx
+
+        rationale = generate_explanation_for_response(
+            client=client,
+            model=model,
+            seeker_post=seeker_post,
+            llm_response=llm_response,
+        )
+
+        with save_lock:
+            out_df.at[idx, RATIONALE_COL] = rationale
+            out_df.to_csv(output_csv, index=False, encoding="utf-8")
+
+        if pbar is not None:
+            pbar.update(1)
+        else:
+            print(f"[Done] ID: {sp_id} da giai thich xong")
+
+        return idx
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(worker_task, idx) for idx in target_indices]
+        for _ in as_completed(futures):
+            pass
+
+    if pbar is not None:
+        pbar.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="LLM responder ho tro chay song song cho tap du lieu seeker_post su dung Groq")
+    parser.add_argument("--input", default=DEFAULT_INPUT_CSV, help="File CSV chua seeker_post da lay mau (default: sampled_1000_seeker_posts.csv)")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT_CSV, help="File CSV luu ket qua kem phan hoi (default: sampled_1000_with_responses.csv)")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Ten mo hinh Groq (default: qwen/qwen3.8-27b)")
+    parser.add_argument("--limit", type=int, default=None, help="So luong cau muon chay thu nghiem (vi du: --limit 10)")
+    parser.add_argument("--concurrency", "-c", type=int, default=5, help="So luong request chay song song (default: 5, dat 1 de stream truc tiep)")
+    parser.add_argument("--delay", type=float, default=0.5, help="Thoi gian nghi (giay) khi chay tuan tu (default: 0.5s)")
+    parser.add_argument("--verbose", action="store_true", help="In tom tat phan hoi khi chay song song")
+    parser.add_argument(
+        "--mode",
+        choices=["respond", "explain"],
+        default="respond",
+        help=(
+            "'respond' (mac dinh): sinh cot llm_response nhu cu, khong doi. "
+            f"'explain': doc file --output DA CO SAN, chi dien them cot '{RATIONALE_COL}' "
+            "giai thich vi sao LLM tra loi nhu vay cho nhung dong da co llm_response "
+            "nhung chua co rationale. Khong dung vao llm_response da co."
+        ),
+    )
+    parser.add_argument(
+        "--explain-model",
+        default=None,
+        help="Model rieng cho buoc --mode explain. Mac dinh dung chung gia tri --model.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "default", "low", "medium", "high"],
+        default="none",
+        help=(
+            "Chi ap dung khi --mode respond. Mac dinh 'none' = giu nguyen hanh vi cu "
+            "(khong reasoning). Dat 'low'/'medium'/'high' de BAT reasoning that su cua "
+            f"model va luu vet suy nghi vao cot '{REASONING_COL}' — sinh CUNG luc voi "
+            "llm_response (khong phai goi API lan 2). LUU Y: bat reasoning co the lam "
+            "thay doi noi dung llm_response so voi ban da sinh truoc do bang reasoning_effort=none, "
+            "va se cham hon / ton token hon. Nhung dong da co san llm_response se KHONG "
+            "bi dong lai (van giu nguyen, se KHONG duoc bo sung reasoning)."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-format",
+        choices=["parsed", "raw", "hidden"],
+        default="parsed",
+        help=(
+            "Chi co y nghia khi --reasoning-effort khac 'none'. 'parsed' (mac dinh, khuyen dung): "
+            f"tach rieng vet suy nghi vao cot '{REASONING_COL}'. 'raw': vet suy nghi nam trong "
+            "the <think>...</think> ngay trong llm_response (se can tu tach ra sau). 'hidden': "
+            "model van suy nghi nhung khong tra ve vet suy nghi (cot reasoning se rong)."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Xac nhan cho phep GHI DE llm_response o nhung dong da co san, khi bat "
+            "--reasoning-effort va can regenerate de gan them reasoning. Khong co flag "
+            "nay, script se dung lai truoc khi ghi de bat ky du lieu cu nao."
+        ),
+    )
+    args = parser.parse_args()
+
+    # 1. Kiểm tra API Key
+    check_api_key()
+    client = Groq()
+
+    # ==================== CHE DO GIAI THICH ====================
+    if args.mode == "explain":
+        if not os.path.exists(args.output):
+            print(f"[LOI] Khong tim thay file {args.output}. Hay chay --mode respond truoc de tao file nay.")
+            sys.exit(1)
+
+        out_df = pd.read_csv(args.output)
+        if RESPONSE_COL not in out_df.columns:
+            print(f"[LOI] File {args.output} chua co cot '{RESPONSE_COL}'.")
+            sys.exit(1)
+        if RATIONALE_COL not in out_df.columns:
+            out_df[RATIONALE_COL] = None
+
+        max_rows = len(out_df) if args.limit is None else min(args.limit, len(out_df))
+        pending_indices = []
+        for idx in range(max_rows):
+            resp = out_df.at[idx, RESPONSE_COL]
+            rat = out_df.at[idx, RATIONALE_COL]
+            has_response = not (pd.isna(resp) or str(resp).strip() == "")
+            needs_rationale = pd.isna(rat) or str(rat).strip() == ""
+            if has_response and needs_rationale:
+                pending_indices.append(idx)
+
+        print("=" * 60)
+        print(f"Tong so dong: {max_rows} | Can giai thich them: {len(pending_indices)}")
+        print(f"Model giai thich: {args.explain_model or args.model}")
+        print("=" * 60)
+
+        if not pending_indices:
+            print("Tat ca cac dong da co giai thich. Khong can xu ly them.")
+            return
+
+        try:
+            process_explain_parallel(
+                client=client,
+                model=args.explain_model or args.model,
+                out_df=out_df,
+                target_indices=pending_indices,
+                output_csv=args.output,
+                concurrency=args.concurrency,
+            )
+        except KeyboardInterrupt:
+            print("\n[Canh bao] Nguoi dung da dung tien trinh (Ctrl+C). Tien do da duoc tu dong luu lai an toan!")
+        finally:
+            out_df.to_csv(args.output, index=False, encoding="utf-8")
+
+        print(f"Hoan thanh giai thich! Du lieu da duoc luu tai: {args.output}")
+        return
+
+    # ==================== CHE DO SINH PHAN HOI (mac dinh, giu nguyen nhu cu) ====================
+    # 2. Đọc dữ liệu đầu vào
+    if not os.path.exists(args.input):
+        print(f"[LOI] Khong tim thay file dau vao: {args.input}")
+        print("Hay chay prepare_sample.py truoc de tao file 1000 cau.")
+        sys.exit(1)
+
+    df = pd.read_csv(args.input)
+    print(f"Loaded {len(df)} dong tu {args.input}")
+
+    # 3. Quản lý Resume (tiếp tục từ vị trí đã chạy trước đó nếu file output đã tồn tại)
+    if os.path.exists(args.output):
+        out_df = pd.read_csv(args.output)
+        if "llm_response" not in out_df.columns:
+            out_df["llm_response"] = None
+    else:
+        out_df = df.copy()
+        out_df["llm_response"] = None
+
+    if args.reasoning_effort != "none" and REASONING_COL not in out_df.columns:
+        out_df[REASONING_COL] = None
+
+    # Lọc các dòng cần xử lý.
+    # - Mặc định (reasoning_effort="none"): 1 dòng coi là xong khi đã có llm_response
+    #   (y het logic cu, KHONG doi).
+    # - Khi reasoning_effort != "none": 1 dòng còn "pending" nếu THIẾU llm_response
+    #   HOẶC thiếu llm_reasoning — vì 2 cột này phải sinh cùng lúc trong 1 lệnh gọi,
+    #   không thể chỉ bổ sung riêng cột reasoning cho dòng đã có sẵn response.
+    max_rows = len(out_df) if args.limit is None else min(args.limit, len(out_df))
+    pending_indices = []
+    overwrite_indices = []  # các dòng ĐÃ có llm_response, sẽ bị GHI ĐÈ để gắn reasoning
+    for idx in range(max_rows):
+        val = out_df.at[idx, "llm_response"]
+        missing_response = pd.isna(val) or str(val).strip() == ""
+
+        needs_reasoning = False
+        if args.reasoning_effort != "none":
+            rval = out_df.at[idx, REASONING_COL]
+            needs_reasoning = pd.isna(rval) or str(rval).strip() == ""
+
+        if missing_response or needs_reasoning:
+            pending_indices.append(idx)
+            if not missing_response:
+                overwrite_indices.append(idx)
+
+    already_done = max_rows - len(pending_indices)
+    print("=" * 60)
+    print(f"Tong so cau du kien xu ly: {max_rows}")
+    print(f"Da hoan thanh truoc do:     {already_done}")
+    print(f"So cau can xu ly tiep:     {len(pending_indices)}")
+    print(f"Mo hinh LLM:               {args.model}")
+    print(f"So luong request song song: {args.concurrency}")
+    print(f"Reasoning effort:          {args.reasoning_effort}")
+    if args.reasoning_effort != "none":
+        print(f"Reasoning format:          {args.reasoning_format}")
+        print(f"Cot vet suy nghi:          {REASONING_COL}")
+        if overwrite_indices:
+            print(
+                f"[CANH BAO] {len(overwrite_indices)} dong DA CO san llm_response nhung "
+                f"chua co '{REASONING_COL}'. De gan reasoning, script se GOI LAI API va "
+                "GHI DE llm_response cu cua nhung dong nay (response + reasoning phai sinh "
+                "cung 1 luc, khong tach rieng duoc)."
+            )
+    print("=" * 60)
+
+    if not pending_indices:
+        print("Tat ca cac cau da co phan hoi (va reasoning, neu co bat)! Khong can xu ly them.")
+        out_df.to_csv(args.output, index=False, encoding="utf-8")
+        return
+
+    if overwrite_indices and not args.yes:
+        print(
+            f"[DUNG LAI] Can flag --yes de xac nhan GHI DE {len(overwrite_indices)} dong "
+            "da co llm_response (nham gan them reasoning). Chay lai voi --yes neu dong y, "
+            "vi du:\n"
+            f"  python {os.path.basename(__file__)} --output {args.output} "
+            f"--reasoning-effort {args.reasoning_effort} --yes"
+        )
+        return
+
+
+
+    # 4. Thực thi (Chạy song song hoặc tuần tự)
+    start_time = time.time()
+    try:
+        if args.concurrency > 1:
+            process_parallel(
+                client=client,
+                model=args.model,
+                out_df=out_df,
+                target_indices=pending_indices,
+                output_csv=args.output,
+                concurrency=args.concurrency,
+                verbose=args.verbose,
+                reasoning_effort=args.reasoning_effort,
+                reasoning_format=args.reasoning_format,
+            )
+        else:
+            process_sequential(
+                client=client,
+                model=args.model,
+                out_df=out_df,
+                target_indices=pending_indices,
+                output_csv=args.output,
+                delay=args.delay,
+                reasoning_effort=args.reasoning_effort,
+                reasoning_format=args.reasoning_format,
+            )
+    except KeyboardInterrupt:
+        print("\n[Canh bao] Nguoi dung da dung tien trinh (Ctrl+C). Tien do da duoc tu dong luu lai an toan!")
+    finally:
+        out_df.to_csv(args.output, index=False, encoding="utf-8")
+
+    elapsed = time.time() - start_time
+    print("=" * 60)
+    print(f"Hoan thanh sau {elapsed:.2f}s! Du lieu da duoc luu tai: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
